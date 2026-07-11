@@ -1,6 +1,6 @@
 {
   "name": "pi-nano-context",
-  "version": "0.1.2-molaison.1",
+  "version": "0.1.2-molaison.2",
   "description": "A tiny pi.dev extension. It replaces the default context meter with a compact segmented bar under the editor so you can see what is using the window.",
   "type": "module",
   "license": "MIT",

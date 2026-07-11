@@ -48,6 +48,7 @@ type SessionUsageTotals = Readonly<{
 	cacheWrite: number;
 	cost: number;
 	latestCacheHitRate: number | undefined;
+	totalCacheHitRate: number | undefined;
 }>;
 
 const emptyContextSegments = (): WritableContextSegments => ({
@@ -388,21 +389,28 @@ const cumulativeUsage = (ctx: ExtensionContext): SessionUsageTotals => {
 	const latestCacheHitRate = latestUsage && latestPromptTokens > 0
 		? (latestUsage.cacheRead / latestPromptTokens) * 100
 		: undefined;
+	const totalPromptTokens = input + cacheRead + cacheWrite;
+	const totalCacheHitRate = totalPromptTokens > 0
+		? (cacheRead / totalPromptTokens) * 100
+		: undefined;
 
-	return { input, output, cacheRead, cacheWrite, cost, latestCacheHitRate };
+	return { input, output, cacheRead, cacheWrite, cost, latestCacheHitRate, totalCacheHitRate };
 };
 
 const formatFooterUsage = (ctx: ExtensionContext, compact: boolean): string => {
 	const usage = cumulativeUsage(ctx);
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	const labels = compact
-		? { prompt: "P", output: "O", cacheRead: "C", cacheWrite: "W", hit: "H" }
-		: { prompt: "prompt ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", hit: "last-hit " };
+		? { prompt: "P", output: "O", cacheRead: "C", cacheWrite: "W", latestHit: "LH", totalHit: "TH" }
+		: { prompt: "prompt ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", latestHit: "last-hit ", totalHit: "total-hit " };
 	const parts = [
 		promptTokens > 0 ? `${labels.prompt}${formatTokens(promptTokens)}` : "",
 		usage.cacheRead > 0 ? `${labels.cacheRead}${formatTokens(usage.cacheRead)}` : "",
-		(usage.cacheRead > 0 || usage.cacheWrite > 0) && usage.latestCacheHitRate !== undefined
-			? `${labels.hit}${usage.latestCacheHitRate.toFixed(1)}%`
+		usage.latestCacheHitRate !== undefined
+			? `${labels.latestHit}${usage.latestCacheHitRate.toFixed(1)}%`
+			: "",
+		usage.totalCacheHitRate !== undefined
+			? `${labels.totalHit}${usage.totalCacheHitRate.toFixed(1)}%`
 			: "",
 		usage.cacheWrite > 0 ? `${labels.cacheWrite}${formatTokens(usage.cacheWrite)}` : "",
 		usage.output > 0 ? `${labels.output}${formatTokens(usage.output)}` : "",

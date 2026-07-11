@@ -19,13 +19,14 @@ The footer adds explicit accounting labels instead of ambiguous arrows:
 - `prompt` — cumulative prompt volume: `input + cacheRead + cacheWrite`.
 - `cache` — cumulative tokens the provider reported as served from cache.
 - `last-hit` — latest request on the active branch: `cacheRead / (input + cacheRead + cacheWrite)`.
+- `total-hit` — weighted rate across all requests in the session: total `cacheRead / (input + cacheRead + cacheWrite)`.
 - `write` — cumulative provider-reported cache creation tokens.
 - `out` — cumulative output tokens.
 - `$` — cumulative reported cost.
 
-On narrow terminals the labels become `P`, `C`, `H`, `W`, and `O`.
+On narrow terminals the labels become `P`, `C`, `LH`, `TH`, `W`, and `O`.
 
-Cache creation is **not** counted as a hit: only `cacheRead` is in the numerator. `cacheWrite` is in the denominator and is displayed separately. OpenAI currently reports automatic cache creation as uncached input rather than `cacheWrite`; only API `cached_tokens` contributes to `cache` and `last-hit`.
+Cache creation is **not** counted as a hit: only `cacheRead` is in either hit-rate numerator. `cacheWrite` is in the denominator and is displayed separately. `total-hit` is token-weighted rather than an average of per-request percentages. OpenAI currently reports automatic cache creation as uncached input rather than `cacheWrite`; only API `cached_tokens` contributes to `cache`, `last-hit`, and `total-hit`.
 
 ## Segments
 
