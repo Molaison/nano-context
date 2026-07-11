@@ -82,7 +82,7 @@ type SessionUsageTotals = Readonly<{
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
-	externalPrompt: number;
+	external: TrackedUsage;
 	latestCacheHitRate: number | undefined;
 	totalCacheHitRate: number | undefined;
 }>;
@@ -527,21 +527,28 @@ const cumulativeUsage = (ctx: ExtensionContext): SessionUsageTotals => {
 	const cacheRead = main.cacheRead + external.cacheRead;
 	const cacheWrite = main.cacheWrite + external.cacheWrite;
 	const cost = main.cost + external.cost;
-	const externalPrompt = external.input + external.cacheRead + external.cacheWrite;
 	const totalPromptTokens = input + cacheRead + cacheWrite;
 	const totalCacheHitRate = totalPromptTokens > 0
 		? (cacheRead / totalPromptTokens) * 100
 		: undefined;
 
-	return { input, output, cacheRead, cacheWrite, cost, externalPrompt, latestCacheHitRate, totalCacheHitRate };
+	return {
+		input,
+		output,
+		cacheRead,
+		cacheWrite,
+		cost,
+		external: { ...external },
+		latestCacheHitRate,
+		totalCacheHitRate,
+	};
 };
 
-const formatFooterUsage = (ctx: ExtensionContext, compact: boolean): string => {
-	const usage = cumulativeUsage(ctx);
+const formatFooterUsage = (usage: SessionUsageTotals, compact: boolean): string => {
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	const labels = compact
-		? { prompt: "P", external: "X", output: "O", cacheRead: "C", cacheWrite: "W", latestHit: "MH", totalHit: "AH" }
-		: { prompt: "prompt ", external: "external ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", latestHit: "main-hit ", totalHit: "all-hit " };
+		? { prompt: "P", output: "O", cacheRead: "C", cacheWrite: "W", latestHit: "LH", totalHit: "AH" }
+		: { prompt: "prompt ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", latestHit: "last-hit ", totalHit: "all-hit " };
 	const parts = [
 		promptTokens > 0 ? `${labels.prompt}${formatTokens(promptTokens)}` : "",
 		usage.cacheRead > 0 ? `${labels.cacheRead}${formatTokens(usage.cacheRead)}` : "",
@@ -551,13 +558,38 @@ const formatFooterUsage = (ctx: ExtensionContext, compact: boolean): string => {
 		usage.totalCacheHitRate !== undefined
 			? `${labels.totalHit}${usage.totalCacheHitRate.toFixed(1)}%`
 			: "",
-		usage.externalPrompt > 0 ? `${labels.external}${formatTokens(usage.externalPrompt)}` : "",
 		usage.cacheWrite > 0 ? `${labels.cacheWrite}${formatTokens(usage.cacheWrite)}` : "",
 		usage.output > 0 ? `${labels.output}${formatTokens(usage.output)}` : "",
 		usage.cost > 0 ? `$${usage.cost.toFixed(3)}` : "",
 	];
 
 	return parts.filter(Boolean).join(" ");
+};
+
+const formatExternalUsage = (external: TrackedUsage, compact: boolean): string => {
+	if (!hasTrackedUsage(external)) return compact ? "X none" : "external none";
+
+	const promptTokens = external.input + external.cacheRead + external.cacheWrite;
+	const cacheHit = promptTokens > 0 ? `${((external.cacheRead / promptTokens) * 100).toFixed(1)}%` : "n/a";
+	return compact
+		? [
+			"X",
+			`P${formatTokens(promptTokens)}`,
+			`C${formatTokens(external.cacheRead)}`,
+			`H${cacheHit}`,
+			`W${formatTokens(external.cacheWrite)}`,
+			`O${formatTokens(external.output)}`,
+			`$${external.cost.toFixed(3)}`,
+		].join(" ")
+		: [
+			"external",
+			`prompt ${formatTokens(promptTokens)}`,
+			`cache ${formatTokens(external.cacheRead)}`,
+			`hit ${cacheHit}`,
+			`write ${formatTokens(external.cacheWrite)}`,
+			`out ${formatTokens(external.output)}`,
+			`$${external.cost.toFixed(3)}`,
+		].join(" ");
 };
 
 const formatFooterModel = (pi: ExtensionAPI, ctx: ExtensionContext, footerData: FooterData): string => {
@@ -573,8 +605,9 @@ const formatFooterModel = (pi: ExtensionAPI, ctx: ExtensionContext, footerData: 
 const renderFooter = (pi: ExtensionAPI, ctx: ExtensionContext, footerData: FooterData, width: number, theme: Theme): string[] => {
 	const workingDirectory = theme.fg("dim", truncatePlainText(formatWorkingDirectory(ctx, footerData), width));
 	const model = formatFooterModel(pi, ctx, footerData);
-	const fullUsage = formatFooterUsage(ctx, false);
-	const compactUsage = formatFooterUsage(ctx, true);
+	const sessionUsage = cumulativeUsage(ctx);
+	const fullUsage = formatFooterUsage(sessionUsage, false);
+	const compactUsage = formatFooterUsage(sessionUsage, true);
 	const usageCandidate = plainWidth(fullUsage) + 2 + plainWidth(model) <= width ? fullUsage : compactUsage;
 	const usage = truncatePlainText(usageCandidate, width);
 	const minimumGap = usage.length > 0 ? 2 : 0;
@@ -584,14 +617,20 @@ const renderFooter = (pi: ExtensionAPI, ctx: ExtensionContext, footerData: Foote
 		? Math.max(minimumGap, width - plainWidth(usage) - plainWidth(modelText))
 		: 0;
 	const line = theme.fg("dim", `${usage}${" ".repeat(gap)}${modelText}`);
+	const fullExternalUsage = formatExternalUsage(sessionUsage.external, false);
+	const compactExternalUsage = formatExternalUsage(sessionUsage.external, true);
+	const externalCandidate = plainWidth(fullExternalUsage) <= width ? fullExternalUsage : compactExternalUsage;
+	const externalText = width === 1 ? "X" : truncatePlainText(externalCandidate, width);
+	const externalLine = theme.fg("dim", externalText);
 	const statuses = Array.from(footerData.getExtensionStatuses().entries())
 		.sort(([left], [right]) => left.localeCompare(right))
 		.map(([, text]) => sanitizeStatus(text))
 		.join(" ");
+	const lines = [workingDirectory, line, externalLine];
 
 	return statuses.length > 0
-		? [workingDirectory, line, theme.fg("dim", truncatePlainText(statuses, width))]
-		: [workingDirectory, line];
+		? [...lines, theme.fg("dim", truncatePlainText(statuses, width))]
+		: lines;
 };
 
 const updateUi = (pi: ExtensionAPI, ctx: ExtensionContext, messages: readonly unknown[] = sessionMessages(ctx)): void => {

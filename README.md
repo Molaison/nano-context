@@ -14,20 +14,23 @@ This is [Molaison's fork](https://github.com/Molaison/nano-context) of [daynin/n
 
 The bar under the editor splits the active model window into system prompt, user prompts, assistant replies, thinking, tool results, and free space.
 
-The footer adds explicit accounting across the main session and tracked side calls:
+The footer adds two explicit accounting lines.
+
+The first line covers the main session plus all tracked side calls:
 
 - `prompt` — all tracked prompt volume: `input + cacheRead + cacheWrite`.
 - `cache` — all tracked tokens the provider reported as served from cache.
-- `main-hit` — latest main-session request on the active branch: `cacheRead / (input + cacheRead + cacheWrite)`.
+- `last-hit` — latest main-session request on the active branch: `cacheRead / (input + cacheRead + cacheWrite)`.
 - `all-hit` — token-weighted rate across all tracked requests in the session tree.
-- `external` — prompt volume from tracked calls outside the main session.
 - `write` — all tracked provider-reported cache creation tokens.
 - `out` — all tracked output tokens.
 - `$` — all tracked reported cost.
 
-On narrow terminals the labels become `P`, `C`, `MH`, `AH`, `X`, `W`, and `O`.
+The second line is always present and isolates side calls as `external prompt/cache/hit/write/out/$`. It reads `external none` until a tracked side call records usage, so zero usage is visible rather than silently omitted. External `hit` is the token-weighted cache rate across external calls only.
 
-Cache creation is **not** counted as a hit: only `cacheRead` is in either hit-rate numerator. `cacheWrite` is in the denominator and is displayed separately. `all-hit` is token-weighted rather than an average of per-request percentages. OpenAI currently reports automatic cache creation as uncached input rather than `cacheWrite`; only API `cached_tokens` contributes to `cache`, `main-hit`, and `all-hit`.
+On narrow terminals, the overall line uses `P/C/LH/AH/W/O`; the external line uses `X P/C/H/W/O/$`.
+
+Cache creation is **not** counted as a hit: only `cacheRead` is in either hit-rate numerator. `cacheWrite` is in the denominator and is displayed separately. Hit rates are token-weighted rather than averages of per-request percentages. OpenAI currently reports automatic cache creation as uncached input rather than `cacheWrite`; only API `cached_tokens` contributes to `cache`, `last-hit`, `all-hit`, and external `hit`.
 
 ## Tracked side calls
 
