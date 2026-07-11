@@ -1,17 +1,17 @@
 {
   "name": "pi-nano-context",
-  "version": "0.1.1",
+  "version": "0.1.2-molaison.1",
   "description": "A tiny pi.dev extension. It replaces the default context meter with a compact segmented bar under the editor so you can see what is using the window.",
   "type": "module",
   "license": "MIT",
   "author": "Sergey Golovin",
-  "homepage": "https://github.com/daynin/nano-context",
+  "homepage": "https://github.com/Molaison/nano-context",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/daynin/nano-context.git"
+    "url": "git+https://github.com/Molaison/nano-context.git"
   },
   "bugs": {
-    "url": "https://github.com/daynin/nano-context/issues"
+    "url": "https://github.com/Molaison/nano-context/issues"
   },
   "keywords": ["pi-package"],
   "files": [
@@ -22,16 +22,16 @@
   ],
   "pi": {
     "extensions": ["./index.ts"],
-    "image": "https://github.com/daynin/nano-context/blob/main/imgs/example.png?raw=true"
+    "image": "https://github.com/Molaison/nano-context/blob/main/imgs/example.png?raw=true"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.73.0",
+    "@earendil-works/pi-coding-agent": "^0.80.6",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"
   }

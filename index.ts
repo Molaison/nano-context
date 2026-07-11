@@ -3,7 +3,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	type Theme,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 
 const WIDGET_KEY = "nano-context";
 const CHARACTERS_PER_TOKEN = 4;
@@ -47,6 +47,7 @@ type SessionUsageTotals = Readonly<{
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
+	latestCacheHitRate: number | undefined;
 }>;
 
 const emptyContextSegments = (): WritableContextSegments => ({
@@ -367,23 +368,44 @@ const cumulativeUsage = (ctx: ExtensionContext): SessionUsageTotals => {
 	for (const entry of ctx.sessionManager.getEntries()) {
 		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
 
-		input += entry.message.usage.input;
-		output += entry.message.usage.output;
-		cacheRead += entry.message.usage.cacheRead;
-		cacheWrite += entry.message.usage.cacheWrite;
-		cost += entry.message.usage.cost.total;
+		const messageUsage = entry.message.usage;
+		input += messageUsage.input;
+		output += messageUsage.output;
+		cacheRead += messageUsage.cacheRead;
+		cacheWrite += messageUsage.cacheWrite;
+		cost += messageUsage.cost.total;
 	}
 
-	return { input, output, cacheRead, cacheWrite, cost };
+	const latestAssistantEntry = [...ctx.sessionManager.getBranch()]
+		.reverse()
+		.find((entry) => entry.type === "message" && entry.message.role === "assistant");
+	const latestUsage = latestAssistantEntry?.type === "message" && latestAssistantEntry.message.role === "assistant"
+		? latestAssistantEntry.message.usage
+		: undefined;
+	const latestPromptTokens = latestUsage
+		? latestUsage.input + latestUsage.cacheRead + latestUsage.cacheWrite
+		: 0;
+	const latestCacheHitRate = latestUsage && latestPromptTokens > 0
+		? (latestUsage.cacheRead / latestPromptTokens) * 100
+		: undefined;
+
+	return { input, output, cacheRead, cacheWrite, cost, latestCacheHitRate };
 };
 
-const formatFooterUsage = (ctx: ExtensionContext): string => {
+const formatFooterUsage = (ctx: ExtensionContext, compact: boolean): string => {
 	const usage = cumulativeUsage(ctx);
+	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+	const labels = compact
+		? { prompt: "P", output: "O", cacheRead: "C", cacheWrite: "W", hit: "H" }
+		: { prompt: "prompt ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", hit: "last-hit " };
 	const parts = [
-		usage.input > 0 ? `↑${formatTokens(usage.input)}` : "",
-		usage.output > 0 ? `↓${formatTokens(usage.output)}` : "",
-		usage.cacheRead > 0 ? `R${formatTokens(usage.cacheRead)}` : "",
-		usage.cacheWrite > 0 ? `W${formatTokens(usage.cacheWrite)}` : "",
+		promptTokens > 0 ? `${labels.prompt}${formatTokens(promptTokens)}` : "",
+		usage.cacheRead > 0 ? `${labels.cacheRead}${formatTokens(usage.cacheRead)}` : "",
+		(usage.cacheRead > 0 || usage.cacheWrite > 0) && usage.latestCacheHitRate !== undefined
+			? `${labels.hit}${usage.latestCacheHitRate.toFixed(1)}%`
+			: "",
+		usage.cacheWrite > 0 ? `${labels.cacheWrite}${formatTokens(usage.cacheWrite)}` : "",
+		usage.output > 0 ? `${labels.output}${formatTokens(usage.output)}` : "",
 		usage.cost > 0 ? `$${usage.cost.toFixed(3)}` : "",
 	];
 
@@ -402,12 +424,17 @@ const formatFooterModel = (pi: ExtensionAPI, ctx: ExtensionContext, footerData: 
 
 const renderFooter = (pi: ExtensionAPI, ctx: ExtensionContext, footerData: FooterData, width: number, theme: Theme): string[] => {
 	const workingDirectory = theme.fg("dim", truncatePlainText(formatWorkingDirectory(ctx, footerData), width));
-	const usage = formatFooterUsage(ctx);
 	const model = formatFooterModel(pi, ctx, footerData);
+	const fullUsage = formatFooterUsage(ctx, false);
+	const compactUsage = formatFooterUsage(ctx, true);
+	const usageCandidate = plainWidth(fullUsage) + 2 + plainWidth(model) <= width ? fullUsage : compactUsage;
+	const usage = truncatePlainText(usageCandidate, width);
 	const minimumGap = usage.length > 0 ? 2 : 0;
-	const modelWidth = Math.max(0, width - usage.length - minimumGap);
+	const modelWidth = Math.max(0, width - plainWidth(usage) - minimumGap);
 	const modelText = truncatePlainText(model, modelWidth);
-	const gap = Math.max(minimumGap, width - usage.length - plainWidth(modelText));
+	const gap = modelText.length > 0
+		? Math.max(minimumGap, width - plainWidth(usage) - plainWidth(modelText))
+		: 0;
 	const line = theme.fg("dim", `${usage}${" ".repeat(gap)}${modelText}`);
 	const statuses = Array.from(footerData.getExtensionStatuses().entries())
 		.sort(([left], [right]) => left.localeCompare(right))
