@@ -14,19 +14,34 @@ This is [Molaison's fork](https://github.com/Molaison/nano-context) of [daynin/n
 
 The bar under the editor splits the active model window into system prompt, user prompts, assistant replies, thinking, tool results, and free space.
 
-The footer adds explicit accounting labels instead of ambiguous arrows:
+The footer adds explicit accounting across the main session and tracked side calls:
 
-- `prompt` — cumulative prompt volume: `input + cacheRead + cacheWrite`.
-- `cache` — cumulative tokens the provider reported as served from cache.
-- `last-hit` — latest request on the active branch: `cacheRead / (input + cacheRead + cacheWrite)`.
-- `total-hit` — weighted rate across all requests in the session: total `cacheRead / (input + cacheRead + cacheWrite)`.
-- `write` — cumulative provider-reported cache creation tokens.
-- `out` — cumulative output tokens.
-- `$` — cumulative reported cost.
+- `prompt` — all tracked prompt volume: `input + cacheRead + cacheWrite`.
+- `cache` — all tracked tokens the provider reported as served from cache.
+- `main-hit` — latest main-session request on the active branch: `cacheRead / (input + cacheRead + cacheWrite)`.
+- `all-hit` — token-weighted rate across all tracked requests in the session tree.
+- `external` — prompt volume from tracked calls outside the main session.
+- `write` — all tracked provider-reported cache creation tokens.
+- `out` — all tracked output tokens.
+- `$` — all tracked reported cost.
 
-On narrow terminals the labels become `P`, `C`, `LH`, `TH`, `W`, and `O`.
+On narrow terminals the labels become `P`, `C`, `MH`, `AH`, `X`, `W`, and `O`.
 
-Cache creation is **not** counted as a hit: only `cacheRead` is in either hit-rate numerator. `cacheWrite` is in the denominator and is displayed separately. `total-hit` is token-weighted rather than an average of per-request percentages. OpenAI currently reports automatic cache creation as uncached input rather than `cacheWrite`; only API `cached_tokens` contributes to `cache`, `last-hit`, and `total-hit`.
+Cache creation is **not** counted as a hit: only `cacheRead` is in either hit-rate numerator. `cacheWrite` is in the denominator and is displayed separately. `all-hit` is token-weighted rather than an average of per-request percentages. OpenAI currently reports automatic cache creation as uncached input rather than `cacheWrite`; only API `cached_tokens` contributes to `cache`, `main-hit`, and `all-hit`.
+
+## Tracked side calls
+
+Nano Context persists side-call usage as branch-aware, LLM-hidden `nano-context.usage` session entries. This fork tracks:
+
+- Observational Memory observer, reflector, and dropper requests.
+- `/btw` side questions.
+- `/wtf?` and `/oops?` typo-fix requests.
+- `/until-done` judge requests.
+- Foreground and background `pi-subagents` runs, including producer usage written in direct child sessions.
+
+The context bar still describes only the active main-model context; side calls consume provider tokens and cost but do not occupy that context window. Forks/clones inherit earlier usage entries, so totals describe the retained session lineage rather than a fresh billing period. Destructive session rewrites such as `/wtf!` remove usage entries in the deleted subtree.
+
+MCP services such as DeepWiki/Fast Context and Pi's built-in branch summarizer do not expose token usage through the extension API, so Nano cannot claim those costs. Default Pi compaction is likewise unobservable, although the installed Observational Memory hook supplies compaction without a separate built-in summary request.
 
 ## Segments
 

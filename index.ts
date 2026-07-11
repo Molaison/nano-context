@@ -1,3 +1,5 @@
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import {
 	buildSessionContext,
 	type ExtensionAPI,
@@ -9,6 +11,10 @@ const WIDGET_KEY = "nano-context";
 const CHARACTERS_PER_TOKEN = 4;
 const IMAGE_TOKEN_ESTIMATE = 1200;
 const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
+const USAGE_ENTRY_TYPE = "nano-context.usage";
+const USAGE_EVENT = "nano-context:usage";
+const SUBAGENT_ASYNC_COMPLETE_EVENT = "subagent:async-complete";
+const LISTENER_STATE_KEY = Symbol.for("nano-context.usage-listeners");
 
 const USED_SEGMENT_TEXT = "#15181D";
 const FREE_SEGMENT_FILL = "#242731";
@@ -41,12 +47,42 @@ type FooterData = Readonly<{
 	getAvailableProviderCount(): number;
 }>;
 
+type TrackedUsage = Readonly<{
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}>;
+
+type WritableTrackedUsage = {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+};
+
+type ExternalUsageRecord = Readonly<{
+	version: 1;
+	id: string;
+	source: string;
+	sessionId: string;
+	timestamp: number;
+	usage: TrackedUsage;
+}>;
+
+type UsageListenerState = {
+	dispose(): void;
+};
+
 type SessionUsageTotals = Readonly<{
 	input: number;
 	output: number;
 	cacheRead: number;
 	cacheWrite: number;
 	cost: number;
+	externalPrompt: number;
 	latestCacheHitRate: number | undefined;
 	totalCacheHitRate: number | undefined;
 }>;
@@ -122,6 +158,101 @@ const centeredText = (text: string, width: number): string => {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === "object";
+
+const emptyTrackedUsage = (): WritableTrackedUsage => ({
+	input: 0,
+	output: 0,
+	cacheRead: 0,
+	cacheWrite: 0,
+	cost: 0,
+});
+
+const addTrackedUsage = (target: WritableTrackedUsage, usage: TrackedUsage): void => {
+	target.input += usage.input;
+	target.output += usage.output;
+	target.cacheRead += usage.cacheRead;
+	target.cacheWrite += usage.cacheWrite;
+	target.cost += usage.cost;
+};
+
+const nonNegativeNumber = (value: unknown, label: string): number => {
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+		throw new Error(`Nano Context: ${label} must be a finite non-negative number`);
+	}
+	return value;
+};
+
+const parseTrackedUsage = (value: unknown, label: string): TrackedUsage => {
+	if (!isRecord(value)) throw new Error(`Nano Context: ${label} must be an object`);
+	return {
+		input: nonNegativeNumber(value.input, `${label}.input`),
+		output: nonNegativeNumber(value.output, `${label}.output`),
+		cacheRead: nonNegativeNumber(value.cacheRead, `${label}.cacheRead`),
+		cacheWrite: nonNegativeNumber(value.cacheWrite, `${label}.cacheWrite`),
+		cost: nonNegativeNumber(value.cost, `${label}.cost`),
+	};
+};
+
+const parseExternalUsageRecord = (value: unknown, label: string): ExternalUsageRecord => {
+	if (!isRecord(value)) throw new Error(`Nano Context: ${label} must be an object`);
+	if (value.version !== 1) throw new Error(`Nano Context: ${label}.version must be 1`);
+	for (const key of ["id", "source", "sessionId"] as const) {
+		if (typeof value[key] !== "string" || value[key].length === 0) {
+			throw new Error(`Nano Context: ${label}.${key} must be a non-empty string`);
+		}
+	}
+	return {
+		version: 1,
+		id: value.id as string,
+		source: value.source as string,
+		sessionId: value.sessionId as string,
+		timestamp: nonNegativeNumber(value.timestamp, `${label}.timestamp`),
+		usage: parseTrackedUsage(value.usage, `${label}.usage`),
+	};
+};
+
+const usageRecordKey = (record: ExternalUsageRecord): string => `${record.source}\0${record.id}`;
+
+const hasTrackedUsage = (usage: TrackedUsage): boolean =>
+	usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0 || usage.cost > 0;
+
+const childOriginUsage = async (sessionFiles: readonly string[]): Promise<TrackedUsage> => {
+	const total = emptyTrackedUsage();
+	for (const sessionFile of new Set(sessionFiles)) {
+		const input = createReadStream(sessionFile, { encoding: "utf8" });
+		const lines = createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
+		let childSessionId: string | undefined;
+		let lineNumber = 0;
+		try {
+			for await (const line of lines) {
+				lineNumber++;
+				if (line.trim().length === 0) continue;
+				let entry: unknown;
+				try {
+					entry = JSON.parse(line);
+				} catch (error) {
+					throw new Error(`Nano Context: invalid child session JSONL ${sessionFile}:${lineNumber}`, { cause: error });
+				}
+				if (!isRecord(entry)) continue;
+				if (entry.type === "session") {
+					if (typeof entry.id !== "string" || entry.id.length === 0) {
+						throw new Error(`Nano Context: child session header has no id: ${sessionFile}`);
+					}
+					childSessionId = entry.id;
+					continue;
+				}
+				if (entry.type !== "custom" || entry.customType !== USAGE_ENTRY_TYPE) continue;
+				const record = parseExternalUsageRecord(entry.data, `child usage entry ${sessionFile}:${lineNumber}`);
+				if (record.sessionId === childSessionId) addTrackedUsage(total, record.usage);
+			}
+		} finally {
+			lines.close();
+			input.destroy();
+		}
+		if (!childSessionId) throw new Error(`Nano Context: child session header not found: ${sessionFile}`);
+	}
+	return total;
+};
 
 const contentRecords = (content: unknown): readonly Record<string, unknown>[] =>
 	Array.isArray(content) ? content.filter(isRecord) : [];
@@ -360,21 +491,23 @@ const formatWorkingDirectory = (ctx: ExtensionContext, footerData: FooterData): 
 };
 
 const cumulativeUsage = (ctx: ExtensionContext): SessionUsageTotals => {
-	let input = 0;
-	let output = 0;
-	let cacheRead = 0;
-	let cacheWrite = 0;
-	let cost = 0;
+	const main = emptyTrackedUsage();
+	const external = emptyTrackedUsage();
 
 	for (const entry of ctx.sessionManager.getEntries()) {
-		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-
-		const messageUsage = entry.message.usage;
-		input += messageUsage.input;
-		output += messageUsage.output;
-		cacheRead += messageUsage.cacheRead;
-		cacheWrite += messageUsage.cacheWrite;
-		cost += messageUsage.cost.total;
+		if (entry.type === "message" && entry.message.role === "assistant") {
+			const usage = entry.message.usage;
+			addTrackedUsage(main, {
+				input: usage.input,
+				output: usage.output,
+				cacheRead: usage.cacheRead,
+				cacheWrite: usage.cacheWrite,
+				cost: usage.cost.total,
+			});
+		}
+		if (entry.type === "custom" && entry.customType === USAGE_ENTRY_TYPE) {
+			addTrackedUsage(external, parseExternalUsageRecord(entry.data, `usage entry ${entry.id}`).usage);
+		}
 	}
 
 	const latestAssistantEntry = [...ctx.sessionManager.getBranch()]
@@ -389,20 +522,26 @@ const cumulativeUsage = (ctx: ExtensionContext): SessionUsageTotals => {
 	const latestCacheHitRate = latestUsage && latestPromptTokens > 0
 		? (latestUsage.cacheRead / latestPromptTokens) * 100
 		: undefined;
+	const input = main.input + external.input;
+	const output = main.output + external.output;
+	const cacheRead = main.cacheRead + external.cacheRead;
+	const cacheWrite = main.cacheWrite + external.cacheWrite;
+	const cost = main.cost + external.cost;
+	const externalPrompt = external.input + external.cacheRead + external.cacheWrite;
 	const totalPromptTokens = input + cacheRead + cacheWrite;
 	const totalCacheHitRate = totalPromptTokens > 0
 		? (cacheRead / totalPromptTokens) * 100
 		: undefined;
 
-	return { input, output, cacheRead, cacheWrite, cost, latestCacheHitRate, totalCacheHitRate };
+	return { input, output, cacheRead, cacheWrite, cost, externalPrompt, latestCacheHitRate, totalCacheHitRate };
 };
 
 const formatFooterUsage = (ctx: ExtensionContext, compact: boolean): string => {
 	const usage = cumulativeUsage(ctx);
 	const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
 	const labels = compact
-		? { prompt: "P", output: "O", cacheRead: "C", cacheWrite: "W", latestHit: "LH", totalHit: "TH" }
-		: { prompt: "prompt ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", latestHit: "last-hit ", totalHit: "total-hit " };
+		? { prompt: "P", external: "X", output: "O", cacheRead: "C", cacheWrite: "W", latestHit: "MH", totalHit: "AH" }
+		: { prompt: "prompt ", external: "external ", output: "out ", cacheRead: "cache ", cacheWrite: "write ", latestHit: "main-hit ", totalHit: "all-hit " };
 	const parts = [
 		promptTokens > 0 ? `${labels.prompt}${formatTokens(promptTokens)}` : "",
 		usage.cacheRead > 0 ? `${labels.cacheRead}${formatTokens(usage.cacheRead)}` : "",
@@ -412,6 +551,7 @@ const formatFooterUsage = (ctx: ExtensionContext, compact: boolean): string => {
 		usage.totalCacheHitRate !== undefined
 			? `${labels.totalHit}${usage.totalCacheHitRate.toFixed(1)}%`
 			: "",
+		usage.externalPrompt > 0 ? `${labels.external}${formatTokens(usage.externalPrompt)}` : "",
 		usage.cacheWrite > 0 ? `${labels.cacheWrite}${formatTokens(usage.cacheWrite)}` : "",
 		usage.output > 0 ? `${labels.output}${formatTokens(usage.output)}` : "",
 		usage.cost > 0 ? `$${usage.cost.toFixed(3)}` : "",
@@ -472,6 +612,7 @@ const updateUi = (pi: ExtensionAPI, ctx: ExtensionContext, messages: readonly un
 
 export default function nanoContext(pi: ExtensionAPI): void {
 	let activeContext: ExtensionContext | undefined;
+	let seenUsageRecords = new Set<string>();
 
 	const refreshFromSession = (ctx: ExtensionContext): void => {
 		activeContext = ctx;
@@ -482,13 +623,119 @@ export default function nanoContext(pi: ExtensionAPI): void {
 		if (activeContext) updateUi(pi, activeContext);
 	};
 
-	pi.on("session_start", (_event, ctx) => refreshFromSession(ctx));
+	const persistUsageRecord = (record: ExternalUsageRecord): void => {
+		if (!activeContext || record.sessionId !== activeContext.sessionManager.getSessionId()) return;
+		const key = usageRecordKey(record);
+		if (seenUsageRecords.has(key)) return;
+		seenUsageRecords.add(key);
+		pi.appendEntry(USAGE_ENTRY_TYPE, record);
+		refreshFromSession(activeContext);
+	};
+
+	const reportForegroundSubagent = async (message: unknown, ctx: ExtensionContext): Promise<void> => {
+		if (!isRecord(message) || message.role !== "toolResult" || message.toolName !== "subagent") return;
+		if (!isRecord(message.details) || message.details.totalChildUsage === undefined) return;
+		if (!activeContext) return;
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (sessionId !== activeContext.sessionManager.getSessionId()) return;
+		const usage = emptyTrackedUsage();
+		addTrackedUsage(usage, parseTrackedUsage(message.details.totalChildUsage, "subagent foreground totalChildUsage"));
+		const sessionFiles = Array.isArray(message.details.results)
+			? message.details.results
+				.filter(isRecord)
+				.map((result) => result.sessionFile)
+				.filter((sessionFile): sessionFile is string => typeof sessionFile === "string" && sessionFile.length > 0)
+			: [];
+		addTrackedUsage(usage, await childOriginUsage(sessionFiles));
+		if (!hasTrackedUsage(usage)) return;
+		if (typeof message.toolCallId !== "string" || message.toolCallId.length === 0) {
+			throw new Error("Nano Context: subagent foreground result has no toolCallId");
+		}
+		persistUsageRecord({
+			version: 1,
+			id: `foreground:${message.toolCallId}`,
+			source: "subagents/foreground",
+			sessionId,
+			timestamp: nonNegativeNumber(message.timestamp, "subagent foreground timestamp"),
+			usage,
+		});
+	};
+
+	const reportAsyncSubagent = async (payload: unknown): Promise<void> => {
+		if (!activeContext || !isRecord(payload)) return;
+		const sessionId = activeContext.sessionManager.getSessionId();
+		if (payload.sessionId !== sessionId) return;
+		if (typeof payload.runId !== "string" || payload.runId.length === 0) {
+			throw new Error("Nano Context: async subagent completion has no runId");
+		}
+		if (!Array.isArray(payload.results)) {
+			throw new Error(`Nano Context: async subagent ${payload.runId} has no results array`);
+		}
+		const usage = emptyTrackedUsage();
+		const sessionFiles: string[] = [];
+		for (const [resultIndex, result] of payload.results.entries()) {
+			if (!isRecord(result)) throw new Error(`Nano Context: async subagent result ${resultIndex} is invalid`);
+			if (typeof result.sessionPath === "string" && result.sessionPath.length > 0) sessionFiles.push(result.sessionPath);
+			if (typeof result.sessionFile === "string" && result.sessionFile.length > 0) sessionFiles.push(result.sessionFile);
+			if (result.modelAttempts === undefined) continue;
+			if (!Array.isArray(result.modelAttempts)) {
+				throw new Error(`Nano Context: async subagent result ${resultIndex}.modelAttempts is invalid`);
+			}
+			for (const [attemptIndex, attempt] of result.modelAttempts.entries()) {
+				if (!isRecord(attempt) || attempt.usage === undefined) {
+					throw new Error(`Nano Context: async subagent result ${resultIndex} attempt ${attemptIndex} has no usage`);
+				}
+				addTrackedUsage(usage, parseTrackedUsage(attempt.usage, `async subagent result ${resultIndex} attempt ${attemptIndex}.usage`));
+			}
+		}
+		addTrackedUsage(usage, await childOriginUsage(sessionFiles));
+		if (!hasTrackedUsage(usage)) return;
+		const timestamp = nonNegativeNumber(payload.timestamp, `async subagent ${payload.runId}.timestamp`);
+		persistUsageRecord({
+			version: 1,
+			id: `async:${payload.runId}`,
+			source: "subagents/async",
+			sessionId,
+			timestamp,
+			usage,
+		});
+	};
+
+	const globalState = globalThis as unknown as Record<symbol, UsageListenerState | undefined>;
+	globalState[LISTENER_STATE_KEY]?.dispose();
+	const unsubscribers = [
+		pi.events.on(USAGE_EVENT, (payload: unknown) => {
+			if (!activeContext) throw new Error("Nano Context: usage event received without an active session");
+			persistUsageRecord(parseExternalUsageRecord(payload, "usage event"));
+		}),
+		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, reportAsyncSubagent),
+	];
+	let listenersDisposed = false;
+	const listenerState: UsageListenerState = {
+		dispose(): void {
+			if (listenersDisposed) return;
+			listenersDisposed = true;
+			for (const unsubscribe of unsubscribers) unsubscribe();
+		},
+	};
+	globalState[LISTENER_STATE_KEY] = listenerState;
+
+	pi.on("session_start", (_event, ctx) => {
+		const restoredUsageRecords = new Set<string>();
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom" || entry.customType !== USAGE_ENTRY_TYPE) continue;
+			restoredUsageRecords.add(usageRecordKey(parseExternalUsageRecord(entry.data, `usage entry ${entry.id}`)));
+		}
+		seenUsageRecords = restoredUsageRecords;
+		refreshFromSession(ctx);
+	});
 
 	pi.on("context", (event, ctx) => {
 		activeContext = ctx;
 		updateUi(pi, ctx, event.messages as readonly unknown[]);
 	});
 
+	pi.on("message_end", async (event, ctx) => reportForegroundSubagent(event.message, ctx));
 	pi.on("agent_end", (_event, ctx) => refreshFromSession(ctx));
 	pi.on("model_select", (_event, ctx) => refreshFromSession(ctx));
 	pi.on("thinking_level_select", (_event, ctx) => refreshFromSession(ctx));
@@ -499,6 +746,8 @@ export default function nanoContext(pi: ExtensionAPI): void {
 		ctx.ui.setWidget(WIDGET_KEY, undefined, { placement: "belowEditor" });
 		ctx.ui.setFooter(undefined);
 		activeContext = undefined;
+		listenerState.dispose();
+		if (globalState[LISTENER_STATE_KEY] === listenerState) delete globalState[LISTENER_STATE_KEY];
 		process.stdout.off("resize", refreshFromTerminalSize);
 	});
 
